@@ -13,16 +13,18 @@ import (
 
 type Server struct {
 	dns          *dns.Server
+	aliases      map[string]string
 	cache        *collections.LRUCache
 	domainRegexp *regexp.Regexp
 }
 
-func NewServer(listenAddr string, domain string, cache *collections.LRUCache) (Server, error) {
+func NewServer(listenAddr string, domain string, aliases map[string]string, cache *collections.LRUCache) (Server, error) {
 	var (
 		srv Server
 		err error
 	)
 	srv.dns = &dns.Server{Addr: listenAddr, Net: "udp", Handler: &srv}
+	srv.aliases = aliases
 	srv.cache = cache
 	srv.domainRegexp, err = regexp.Compile(fmt.Sprintf(`(?i)^([0-9a-f]{2}(-[0-9a-f]{2}){1,19})\.%s\.$`, domain))
 	if err != nil {
@@ -47,6 +49,9 @@ func (srv Server) ServeDNS(rw dns.ResponseWriter, req *dns.Msg) {
 	}
 
 	question := req.Question[0]
+	domain := question.Name
+	log := log.WithField("domain", domain)
+
 	if qclass := question.Qclass; qclass != dns.ClassINET {
 		log.Debugf("Got unsupported qclass %s", dns.Class(qclass))
 		formatError(rw, req)
@@ -58,8 +63,10 @@ func (srv Server) ServeDNS(rw dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	domain := question.Name
-	log := log.WithField("domain", domain)
+	if name, ok := srv.aliases[domain]; ok {
+		domain = name
+	}
+
 	matches := srv.domainRegexp.FindStringSubmatch(domain)
 	if len(matches) == 0 {
 		log.Debug("Domain does not match the pattern")
@@ -86,7 +93,7 @@ func (srv Server) ServeDNS(rw dns.ResponseWriter, req *dns.Msg) {
 	reply.SetReply(req)
 	reply.Answer = []dns.RR{&dns.A{
 		Hdr: dns.RR_Header{
-			Name:   domain,
+			Name:   question.Name,
 			Rrtype: dns.TypeA,
 			Class:  dns.ClassINET,
 			Ttl:    0,

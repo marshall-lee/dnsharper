@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"os"
 	"strings"
 	"time"
 
@@ -12,11 +13,12 @@ import (
 )
 
 type CLI struct {
-	Iface  string        `kong:"arg,placeholder='eth0',help='Network interface.'"`
-	Debug  bool          `kong:"short='d',help='Enable debug logging.'"`
-	Period time.Duration `kong:"short='p',help='Scanning period.',default=10s"`
-	Listen string        `kong:"short='l',default='127.0.0.1:5333',help='DNS server listen on.'"`
-	Domain string        `kong:"short='n',default='.dnsharper.local',help='Domain.'"`
+	Iface       string        `kong:"arg,placeholder='eth0',help='Network interface.'"`
+	Debug       bool          `kong:"short='d',help='Enable debug logging.'"`
+	Period      time.Duration `kong:"short='p',help='Scanning period.',default=10s"`
+	Listen      string        `kong:"short='l',default='127.0.0.1:5333',help='DNS server listen on.'"`
+	Domain      string        `kong:"short='n',default='.dnsharper.local',help='Domain.'"`
+	AliasesFile *os.File      `kong:"name='aliases',short='a',help='MAC to hostname mapping file.'"`
 }
 
 func main() {
@@ -35,12 +37,22 @@ func main() {
 
 	cache := collections.NewLRUCache(256 * 256)
 
+	var err error
+
+	var aliases map[string]string
+	if cli.AliasesFile != nil {
+		if aliases, err = readAliases(cli.AliasesFile, cli.Domain); err != nil {
+			log.WithError(err).Fatal("Failed to read aliases file")
+			return
+		}
+	}
+
 	scanner, err := NewScanner(cli.Iface, cli.Period, cli.Domain, cache)
 	if err != nil {
 		log.WithError(err).Fatal("Failed to initialize scanner")
 		return
 	}
-	server, err := NewServer(cli.Listen, cli.Domain, cache)
+	server, err := NewServer(cli.Listen, cli.Domain, aliases, cache)
 	if err != nil {
 		log.WithError(err).Fatal("Failed to DNS server")
 		return
