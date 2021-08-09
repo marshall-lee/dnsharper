@@ -47,7 +47,7 @@ func main() {
 		}
 	}
 
-	scanner, err := NewScanner(cli.Iface, cli.Period, cli.Domain, cache)
+	scanner, err := NewScanner(cli.Iface, cli.Period, cli.Domain, aliases, cache)
 	if err != nil {
 		log.WithError(err).Fatal("Failed to initialize scanner")
 		return

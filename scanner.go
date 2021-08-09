@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,12 +25,13 @@ type Scanner struct {
 	ipnet        *net.IPNet
 	period       time.Duration
 	domainFormat string
+	revAliases   map[string][]string
 	cache        *collections.LRUCache
 }
 
 var ErrNoNetworksFound = errors.New("no networks found")
 
-func NewScanner(ifaceName string, period time.Duration, domain string, cache *collections.LRUCache) (Scanner, error) {
+func NewScanner(ifaceName string, period time.Duration, domain string, aliases map[string]string, cache *collections.LRUCache) (Scanner, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return Scanner{}, err
@@ -60,12 +62,18 @@ func NewScanner(ifaceName string, period time.Duration, domain string, cache *co
 	if err != nil {
 		return Scanner{}, err
 	}
+
+	revAliases := make(map[string][]string, len(aliases))
+	for host, hwAddr := range aliases {
+		revAliases[hwAddr] = append(revAliases[hwAddr], host)
+	}
 	return Scanner{
 		iface:        iface,
 		handle:       handle,
 		ipnet:        ip4net,
 		period:       period,
-		domainFormat: "%s." + domain,
+		domainFormat: "%s." + domain + ".",
+		revAliases:   revAliases,
 		cache:        cache,
 	}, nil
 }
@@ -137,7 +145,21 @@ func (scanner Scanner) reader(ctx context.Context) error {
 			hwAddr := net.HardwareAddr(arp.SourceHwAddress)
 			hwAddrKey := hwAddr.String()
 			if !scanner.cache.AddWithTTL(hwAddrKey, ip, scanner.period+time.Second) {
-				log.Infof("Added IP %v at %v", ip, fmt.Sprintf(scanner.domainFormat, strings.ReplaceAll(hwAddrKey, ":", "-")))
+				domain := fmt.Sprintf(scanner.domainFormat, strings.ReplaceAll(hwAddrKey, ":", "-"))
+				log := log.WithFields(log.Fields{
+					"ip":     ip,
+					"domain": strings.TrimSuffix(domain, "."),
+				})
+				if aliases, ok := scanner.revAliases[domain]; ok {
+					for i, alias := range aliases {
+						key := "domalias"
+						if i > 0 {
+							key = key + strconv.Itoa(i)
+						}
+						log = log.WithField(key, strings.TrimSuffix(alias, "."))
+					}
+				}
+				log.Infof("Added IP address")
 			}
 		case <-ctx.Done():
 			return ctx.Err()

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strings"
 
 	"github.com/mailgun/holster/v3/collections"
 	"github.com/miekg/dns"
@@ -50,7 +51,7 @@ func (srv Server) ServeDNS(rw dns.ResponseWriter, req *dns.Msg) {
 
 	question := req.Question[0]
 	domain := question.Name
-	log := log.WithField("domain", domain)
+	log := log.WithField("domain", strings.TrimSuffix(domain, "."))
 
 	if qclass := question.Qclass; qclass != dns.ClassINET {
 		log.Debugf("Got unsupported qclass %s", dns.Class(qclass))
@@ -88,6 +89,8 @@ func (srv Server) ServeDNS(rw dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 	ip := value.(net.IP)
+
+	log.WithField("ip", ip).Debug("Sending reply")
 
 	var reply dns.Msg
 	reply.SetReply(req)
