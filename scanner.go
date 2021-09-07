@@ -159,7 +159,7 @@ func (scanner Scanner) reader(ctx context.Context) error {
 						log = log.WithField(key, strings.TrimSuffix(alias, "."))
 					}
 				}
-				log.Infof("Added IP address")
+				log.Infof("Added to cache")
 			}
 		case <-ctx.Done():
 			return ctx.Err()

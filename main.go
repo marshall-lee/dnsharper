@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -36,6 +37,12 @@ func main() {
 	cli.Domain = strings.TrimPrefix(cli.Domain, ".")
 
 	cache := collections.NewLRUCache(256 * 256)
+	cache.OnEvicted = func(key collections.Key, value interface{}) {
+		log.WithFields(log.Fields{
+			"domain": strings.ReplaceAll(key.(string), ":", "-") + "." + cli.Domain,
+			"ip":     value.(net.IP),
+		}).Debug("Evicted from cache")
+	}
 
 	var err error
 
