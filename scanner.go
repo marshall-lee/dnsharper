@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -129,43 +130,57 @@ func (scanner Scanner) writer(ctx context.Context) error {
 }
 
 func (scanner Scanner) reader(ctx context.Context) error {
-	src := gopacket.NewPacketSource(scanner.handle, layers.LayerTypeEthernet)
+	var eth layers.Ethernet
+	var arp layers.ARP
+
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &arp)
+
+	var decoded []gopacket.LayerType
 	for {
-		select {
-		case packet := <-src.Packets():
-			arpLayer := packet.Layer(layers.LayerTypeARP)
-			if arpLayer == nil {
-				continue
-			}
-			arp := arpLayer.(*layers.ARP)
-			if arp.Operation != layers.ARPReply {
-				continue
-			}
-			if bytes.Equal(scanner.iface.HardwareAddr, arp.SourceHwAddress) {
-				continue
-			}
-			ip := net.IP(arp.SourceProtAddress).To4()
-			hwAddr := net.HardwareAddr(arp.SourceHwAddress)
-			hwAddrKey := hwAddr.String()
-			if !scanner.cache.AddWithTTL(hwAddrKey, ip, scanner.period+time.Second) {
-				domain := fmt.Sprintf(scanner.domainFormat, strings.ReplaceAll(hwAddrKey, ":", "-"))
-				log := log.WithFields(log.Fields{
-					"ip":     ip,
-					"domain": strings.TrimSuffix(domain, "."),
-				})
-				if aliases, ok := scanner.revAliases[domain]; ok {
-					for i, alias := range aliases {
-						key := "domalias"
-						if i > 0 {
-							key = key + strconv.Itoa(i)
-						}
-						log = log.WithField(key, strings.TrimSuffix(alias, "."))
-					}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		data, _, err := scanner.handle.ReadPacketData()
+		if err == io.EOF {
+			return nil
+		} else if err != nil {
+			log.Error("Error reading packet:", err)
+			continue
+		}
+		if err = parser.DecodeLayers(data, &decoded); err != nil {
+			continue
+		}
+		for _, layerType := range decoded {
+			switch layerType {
+			case layers.LayerTypeARP:
+				if arp.Operation != layers.ARPReply {
+					continue
 				}
-				log.Infof("Added to cache")
+				if bytes.Equal(scanner.iface.HardwareAddr, arp.SourceHwAddress) {
+					continue
+				}
+				ip := net.IP(arp.SourceProtAddress).To4()
+				hwAddr := net.HardwareAddr(arp.SourceHwAddress)
+				hwAddrKey := hwAddr.String()
+				if !scanner.cache.AddWithTTL(hwAddrKey, ip, scanner.period+time.Second) {
+					domain := fmt.Sprintf(scanner.domainFormat, strings.ReplaceAll(hwAddrKey, ":", "-"))
+					log := log.WithFields(log.Fields{
+						"ip":     ip,
+						"domain": strings.TrimSuffix(domain, "."),
+					})
+					if aliases, ok := scanner.revAliases[domain]; ok {
+						for i, alias := range aliases {
+							key := "domalias"
+							if i > 0 {
+								key = key + strconv.Itoa(i)
+							}
+							log = log.WithField(key, strings.TrimSuffix(alias, "."))
+						}
+					}
+					log.Infof("Added to cache")
+				}
 			}
-		case <-ctx.Done():
-			return ctx.Err()
 		}
 	}
 }
