@@ -62,6 +62,9 @@ func NewScanner(ifaceName string, period time.Duration, domain string, aliases m
 	if err != nil {
 		return Scanner{}, err
 	}
+	if linkType := handle.LinkType(); linkType != layers.LinkTypeEthernet {
+		return Scanner{}, fmt.Errorf("network interface %q has unsupported link type %q", iface.Name, linkType)
+	}
 
 	revAliases := make(map[string][]string, len(aliases))
 	for host, hwAddr := range aliases {
