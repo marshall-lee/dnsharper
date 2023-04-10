@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -20,11 +19,16 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const maxTimeout = 10 * time.Second
+
 type Scanner struct {
 	iface        *net.Interface
 	handle       *pcap.Handle
-	ipnet        *net.IPNet
-	period       time.Duration
+	ip4net       *net.IPNet
+	arpTargets   ip4targets
+	cacheTTL     time.Duration
+	interval     time.Duration
+	timeout      time.Duration
 	domainFormat string
 	revAliases   map[string][]string
 	cache        *collections.LRUCache
@@ -32,7 +36,7 @@ type Scanner struct {
 
 var ErrNoNetworksFound = errors.New("no networks found")
 
-func NewScanner(ifaceName string, period time.Duration, domain string, aliases map[string]string, cache *collections.LRUCache) (Scanner, error) {
+func NewScanner(ifaceName string, cacheTTL time.Duration, domain string, aliases map[string]string, cache *collections.LRUCache) (Scanner, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return Scanner{}, err
@@ -71,11 +75,27 @@ func NewScanner(ifaceName string, period time.Duration, domain string, aliases m
 	for host, hwAddr := range aliases {
 		revAliases[hwAddr] = append(revAliases[hwAddr], host)
 	}
+
+	// TODO: move to parameters
+	interval := 4 * time.Millisecond
+	timeout := 500 * time.Millisecond
+
+	var (
+		arpTargets ip4targets
+	)
+
+	if ip4net != nil {
+		arpTargets = makeip4targets(ip4net, timeout)
+	}
+
 	return Scanner{
 		iface:        iface,
 		handle:       handle,
-		ipnet:        ip4net,
-		period:       period,
+		ip4net:       ip4net,
+		arpTargets:   arpTargets,
+		cacheTTL:     cacheTTL,
+		interval:     interval,
+		timeout:      timeout,
 		domainFormat: "%s." + domain + ".",
 		revAliases:   revAliases,
 		cache:        cache,
@@ -99,7 +119,7 @@ func (scanner Scanner) Scan(ctx context.Context) error {
 	}()
 	go func() {
 		defer wg.Done()
-		if err := scanner.writer(ctx); err != nil && err != context.DeadlineExceeded {
+		if err := scanner.writerARP(ctx); err != nil && err != context.DeadlineExceeded {
 			cancel()
 			errors <- err
 		}
@@ -111,21 +131,6 @@ func (scanner Scanner) Scan(ctx context.Context) error {
 		return err
 	default:
 		return nil
-	}
-}
-
-func (scanner Scanner) writer(ctx context.Context) error {
-	ticker := time.NewTicker(scanner.period)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			if err := scanner.doWrite(ctx); err != nil {
-				return err
-			}
-		case <-ctx.Done():
-			return ctx.Err()
-		}
 	}
 }
 
@@ -161,9 +166,12 @@ func (scanner Scanner) reader(ctx context.Context) error {
 					continue
 				}
 				ip := net.IP(arp.SourceProtAddress).To4()
+
+				scanner.arpTargets.reset(ip4(ip))
+
 				hwAddr := net.HardwareAddr(arp.SourceHwAddress)
 				hwAddrKey := hwAddr.String()
-				if !scanner.cache.AddWithTTL(hwAddrKey, ip, scanner.period+time.Second) {
+				if !scanner.cache.AddWithTTL(hwAddrKey, ip, scanner.cacheTTL) {
 					domain := fmt.Sprintf(scanner.domainFormat, strings.ReplaceAll(hwAddrKey, ":", "-"))
 					log := log.WithFields(log.Fields{
 						"ip":     ip,
@@ -185,7 +193,7 @@ func (scanner Scanner) reader(ctx context.Context) error {
 	}
 }
 
-func (scanner Scanner) doWrite(ctx context.Context) error {
+func (scanner Scanner) writerARP(ctx context.Context) error {
 	eth := layers.Ethernet{
 		SrcMAC:       scanner.iface.HardwareAddr,
 		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
@@ -198,7 +206,7 @@ func (scanner Scanner) doWrite(ctx context.Context) error {
 		ProtAddressSize:   4,
 		Operation:         layers.ARPRequest,
 		SourceHwAddress:   []byte(scanner.iface.HardwareAddr),
-		SourceProtAddress: []byte(scanner.ipnet.IP),
+		SourceProtAddress: []byte(scanner.ip4net.IP),
 		DstHwAddress:      []byte{0, 0, 0, 0, 0, 0},
 	}
 	buf := gopacket.NewSerializeBuffer()
@@ -206,34 +214,14 @@ func (scanner Scanner) doWrite(ctx context.Context) error {
 		FixLengths:       true,
 		ComputeChecksums: true,
 	}
-	var err error
-	scanner.RangeIPs(func(ip net.IP) bool {
-		if err = ctx.Err(); err != nil {
-			return false
+	return scanner.arpTargets.loop(ctx, scanner.interval, func(ip4 ip4) error {
+		arp.DstProtAddress = ip4[:]
+		if err := gopacket.SerializeLayers(buf, opts, &eth, &arp); err != nil {
+			return err
 		}
-
-		arp.DstProtAddress = []byte(ip)
-		if err = gopacket.SerializeLayers(buf, opts, &eth, &arp); err != nil {
-			return false
+		if err := scanner.handle.WritePacketData(buf.Bytes()); err != nil {
+			return err
 		}
-		if err = scanner.handle.WritePacketData(buf.Bytes()); err != nil {
-			return false
-		}
-		return true
+		return nil
 	})
-	return err
-}
-
-func (scanner Scanner) RangeIPs(fn func(net.IP) bool) {
-	num := binary.BigEndian.Uint32([]byte(scanner.ipnet.IP))
-	mask := binary.BigEndian.Uint32([]byte(scanner.ipnet.Mask))
-	network := num & mask
-	broadcast := network | ^mask
-	for network++; network < broadcast; network++ {
-		var buf [4]byte
-		binary.BigEndian.PutUint32(buf[:], network)
-		if ip := net.IP(buf[:]); !fn(ip) {
-			break
-		}
-	}
 }

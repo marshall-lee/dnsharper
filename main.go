@@ -16,7 +16,7 @@ import (
 type CLI struct {
 	Iface       string        `kong:"arg,placeholder='eth0',help='Network interface.'"`
 	Debug       bool          `kong:"short='d',help='Enable debug logging.'"`
-	Period      time.Duration `kong:"short='p',help='Scanning period.',default=10s"`
+	TTL         time.Duration `kong:"short='t',help='Cache TTL.',default=10s"`
 	Listen      string        `kong:"short='l',default='127.0.0.1:5333',help='DNS server listen on.'"`
 	Domain      string        `kong:"short='n',default='.dnsharper.local',help='Domain.'"`
 	AliasesFile *os.File      `kong:"name='aliases',short='a',help='MAC to hostname mapping file.'"`
@@ -54,7 +54,7 @@ func main() {
 		}
 	}
 
-	scanner, err := NewScanner(cli.Iface, cli.Period, cli.Domain, aliases, cache)
+	scanner, err := NewScanner(cli.Iface, cli.TTL, cli.Domain, aliases, cache)
 	if err != nil {
 		log.WithError(err).Fatal("Failed to initialize scanner")
 		return
