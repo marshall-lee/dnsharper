@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"strconv"
 	"strings"
@@ -24,8 +25,10 @@ const maxTimeout = 10 * time.Second
 type Scanner struct {
 	iface        *net.Interface
 	handle       *pcap.Handle
+	ip6net       *net.IPNet
 	ip4net       *net.IPNet
 	arpTargets   ip4targets
+	ndpTargets   *ip6targets
 	cacheTTL     time.Duration
 	interval     time.Duration
 	timeout      time.Duration
@@ -45,22 +48,23 @@ func NewScanner(ifaceName string, cacheTTL time.Duration, domain string, aliases
 	if err != nil {
 		return Scanner{}, err
 	}
-	var ip4net *net.IPNet
+	var ip4net, ip6net *net.IPNet
 	for _, addr := range addrs {
 		ipnet, ok := addr.(*net.IPNet)
 		if !ok {
 			continue
 		}
-		ip4 := ipnet.IP.To4()
-		if ip4 == nil {
-			continue
-		}
-		ip4net = &net.IPNet{
-			IP:   ip4,
-			Mask: ipnet.Mask[len(ipnet.Mask)-4:],
+
+		if ip4 := ipnet.IP.To4(); ip4 != nil {
+			ip4net = &net.IPNet{
+				IP:   ip4,
+				Mask: ipnet.Mask[len(ipnet.Mask)-4:],
+			}
+		} else if ip6 := ipnet.IP.To16(); ip6 != nil {
+			ip6net = ipnet
 		}
 	}
-	if ip4net == nil {
+	if ip4net == nil && ip6net == nil {
 		return Scanner{}, ErrNoNetworksFound
 	}
 	handle, err := pcap.OpenLive(iface.Name, 65536, true, pcap.BlockForever)
@@ -77,22 +81,28 @@ func NewScanner(ifaceName string, cacheTTL time.Duration, domain string, aliases
 	}
 
 	// TODO: move to parameters
-	interval := 4 * time.Millisecond
-	timeout := 500 * time.Millisecond
+	interval := 10 * time.Millisecond
+	timeout := 1000 * time.Millisecond
 
 	var (
 		arpTargets ip4targets
+		ndpTargets *ip6targets
 	)
 
 	if ip4net != nil {
 		arpTargets = makeip4targets(ip4net, timeout)
+	}
+	if ip6net != nil {
+		ndpTargets = makeip6targets(timeout)
 	}
 
 	return Scanner{
 		iface:        iface,
 		handle:       handle,
 		ip4net:       ip4net,
+		ip6net:       ip6net,
 		arpTargets:   arpTargets,
+		ndpTargets:   ndpTargets,
 		cacheTTL:     cacheTTL,
 		interval:     interval,
 		timeout:      timeout,
@@ -107,8 +117,8 @@ func (scanner Scanner) Scan(ctx context.Context) error {
 	defer cancel()
 
 	var wg sync.WaitGroup
-	wg.Add(2)
-	errors := make(chan error, 2)
+	wg.Add(1)
+	errors := make(chan error, 4)
 	defer close(errors)
 	go func() {
 		defer wg.Done()
@@ -117,13 +127,33 @@ func (scanner Scanner) Scan(ctx context.Context) error {
 			errors <- err
 		}
 	}()
-	go func() {
-		defer wg.Done()
-		if err := scanner.writerARP(ctx); err != nil && err != context.DeadlineExceeded {
-			cancel()
-			errors <- err
-		}
-	}()
+	if scanner.ip4net != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := scanner.writerARP(ctx); err != nil && err != context.DeadlineExceeded {
+				cancel()
+				errors <- err
+			}
+		}()
+	}
+	if scanner.ip6net != nil {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := scanner.writerNDP(ctx); err != nil && err != context.DeadlineExceeded {
+				cancel()
+				errors <- err
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if err := scanner.writerICMPPing6Multicast(ctx); err != nil && err != context.DeadlineExceeded {
+				cancel()
+				errors <- err
+			}
+		}()
+	}
 	wg.Wait()
 
 	select {
@@ -137,8 +167,13 @@ func (scanner Scanner) Scan(ctx context.Context) error {
 func (scanner Scanner) reader(ctx context.Context) error {
 	var eth layers.Ethernet
 	var arp layers.ARP
+	var ipv6 layers.IPv6
+	var icmpv6 layers.ICMPv6
+	var icmpv6echo layers.ICMPv6Echo
+	var icmpv6ns layers.ICMPv6NeighborSolicitation
+	var icmpv6na layers.ICMPv6NeighborAdvertisement
 
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &arp)
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &arp, &ipv6, &icmpv6, &icmpv6echo, &icmpv6na, &icmpv6ns)
 
 	var decoded []gopacket.LayerType
 	for {
@@ -156,6 +191,10 @@ func (scanner Scanner) reader(ctx context.Context) error {
 		if err = parser.DecodeLayers(data, &decoded); err != nil {
 			continue
 		}
+		var (
+			targetIP     net.IP
+			targetHwAddr net.HardwareAddr
+		)
 		for _, layerType := range decoded {
 			switch layerType {
 			case layers.LayerTypeARP:
@@ -165,30 +204,58 @@ func (scanner Scanner) reader(ctx context.Context) error {
 				if bytes.Equal(scanner.iface.HardwareAddr, arp.SourceHwAddress) {
 					continue
 				}
-				ip := net.IP(arp.SourceProtAddress).To4()
 
-				scanner.arpTargets.reset(ip4(ip))
+				targetIP = net.IP(arp.SourceProtAddress).To4()
+				targetHwAddr = net.HardwareAddr(arp.SourceHwAddress)
+				scanner.arpTargets.reset(ip4(targetIP))
 
-				hwAddr := net.HardwareAddr(arp.SourceHwAddress)
-				hwAddrKey := hwAddr.String()
-				if !scanner.cache.AddWithTTL(hwAddrKey, ip, scanner.cacheTTL) {
-					domain := fmt.Sprintf(scanner.domainFormat, strings.ReplaceAll(hwAddrKey, ":", "-"))
-					log := log.WithFields(log.Fields{
-						"ip":     ip,
-						"domain": strings.TrimSuffix(domain, "."),
-					})
-					if aliases, ok := scanner.revAliases[domain]; ok {
-						for i, alias := range aliases {
-							key := "domalias"
-							if i > 0 {
-								key = key + strconv.Itoa(i)
-							}
-							log = log.WithField(key, strings.TrimSuffix(alias, "."))
+			case layers.LayerTypeICMPv6:
+				switch icmpv6.TypeCode.Type() {
+				case layers.ICMPv6TypeEchoReply:
+					if ipv6.SrcIP.Equal(scanner.ip6net.IP) {
+						continue
+					}
+					scanner.ndpTargets.add(ip6(ipv6.SrcIP.To16()))
+				case layers.ICMPv6TypeNeighborAdvertisement:
+					targetIP = icmpv6na.TargetAddress
+					for _, opt := range icmpv6na.Options {
+						if opt.Type == layers.ICMPv6OptTargetAddress {
+							targetHwAddr = net.HardwareAddr(opt.Data)
 						}
 					}
-					log.Infof("Added to cache")
+					scanner.ndpTargets.reset(ip6(targetIP))
 				}
 			}
+		}
+		if targetIP == nil || targetHwAddr == nil {
+			continue
+		}
+
+		targetHwAddrStr := targetHwAddr.String()
+		var targetHwAddrKey string
+		if targetIP4 := targetIP.To4(); targetIP4 != nil {
+			targetHwAddrKey = "ipv4-" + targetHwAddrStr
+		} else if targetIP16 := targetIP.To16(); targetIP16 != nil {
+			targetHwAddrKey = "ipv6-" + targetHwAddrStr
+		} else {
+			panic(fmt.Sprintf("invalid ip address %v", targetIP))
+		}
+		if !scanner.cache.AddWithTTL(targetHwAddrKey, targetIP, scanner.cacheTTL) {
+			domain := fmt.Sprintf(scanner.domainFormat, strings.ReplaceAll(targetHwAddrStr, ":", "-"))
+			log := log.WithFields(log.Fields{
+				"ip":     targetIP,
+				"domain": strings.TrimSuffix(domain, "."),
+			})
+			if aliases, ok := scanner.revAliases[domain]; ok {
+				for i, alias := range aliases {
+					key := "domalias"
+					if i > 0 {
+						key = key + strconv.Itoa(i)
+					}
+					log = log.WithField(key, strings.TrimSuffix(alias, "."))
+				}
+			}
+			log.Infof("Added to cache")
 		}
 	}
 }
@@ -224,4 +291,96 @@ func (scanner Scanner) writerARP(ctx context.Context) error {
 		}
 		return nil
 	})
+}
+
+func (scanner Scanner) writerNDP(ctx context.Context) error {
+	eth := layers.Ethernet{
+		SrcMAC:       scanner.iface.HardwareAddr,
+		DstMAC:       net.HardwareAddr{0x33, 0x33, 0x00, 0x00, 0x00, 0x00},
+		EthernetType: layers.EthernetTypeIPv6,
+	}
+	ipv6 := layers.IPv6{
+		Version:    6,
+		NextHeader: layers.IPProtocolICMPv6,
+		HopLimit:   255,
+		SrcIP:      scanner.ip6net.IP,
+		DstIP:      net.ParseIP("ff02:0000:0000:0000:0000:0001:ff00:0000"),
+	}
+	icmpv6 := layers.ICMPv6{
+		TypeCode: layers.CreateICMPv6TypeCode(layers.ICMPv6TypeNeighborSolicitation, 0),
+	}
+	icmpv6ns := layers.ICMPv6NeighborSolicitation{
+		Options: layers.ICMPv6Options{
+			layers.ICMPv6Option{Type: layers.ICMPv6OptSourceAddress, Data: []byte(scanner.iface.HardwareAddr)},
+		},
+	}
+	if err := icmpv6.SetNetworkLayerForChecksum(&ipv6); err != nil {
+		return err
+	}
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{
+		FixLengths:       true,
+		ComputeChecksums: true,
+	}
+	return scanner.ndpTargets.loop(ctx, scanner.interval, func(ip6 ip6) error {
+		targetIP := net.IP(ip6[:])
+		copy(ipv6.DstIP[13:], targetIP[len(targetIP)-3:])
+		copy(eth.DstMAC[2:], ipv6.DstIP[len(ipv6.DstIP)-4:])
+		icmpv6ns.TargetAddress = targetIP
+		if err := gopacket.SerializeLayers(buf, opts, &eth, &ipv6, &icmpv6, &icmpv6ns); err != nil {
+			return err
+		}
+		if err := scanner.handle.WritePacketData(buf.Bytes()); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func (scanner Scanner) writerICMPPing6Multicast(ctx context.Context) error {
+	eth := layers.Ethernet{
+		SrcMAC:       scanner.iface.HardwareAddr,
+		DstMAC:       net.HardwareAddr{0x33, 0x33, 0x00, 0x00, 0x00, 0x01},
+		EthernetType: layers.EthernetTypeIPv6,
+	}
+	ipv6 := layers.IPv6{
+		Version:    6,
+		NextHeader: layers.IPProtocolICMPv6,
+		HopLimit:   255,
+		SrcIP:      scanner.ip6net.IP,
+		DstIP:      net.ParseIP("ff02::1"),
+	}
+	icmpv6 := layers.ICMPv6{
+		TypeCode: layers.CreateICMPv6TypeCode(layers.ICMPv6TypeEchoRequest, 0),
+	}
+	icmpv6echo := layers.ICMPv6Echo{
+		Identifier: uint16(rand.Int31()),
+	}
+	if err := icmpv6.SetNetworkLayerForChecksum(&ipv6); err != nil {
+		return err
+	}
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{
+		FixLengths:       true,
+		ComputeChecksums: true,
+	}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	seqNumber := uint16(0)
+	for {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		icmpv6echo.SeqNumber = seqNumber
+		seqNumber++
+		if err := gopacket.SerializeLayers(buf, opts, &eth, &ipv6, &icmpv6, &icmpv6echo); err != nil {
+			return err
+		}
+		if err := scanner.handle.WritePacketData(buf.Bytes()); err != nil {
+			return err
+		}
+	}
 }

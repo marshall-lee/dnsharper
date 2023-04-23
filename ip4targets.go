@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/binary"
-	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -13,7 +12,7 @@ type ip4 [4]byte
 
 type ip4target struct {
 	sync.Mutex
-	timeout   time.Duration
+	backoff
 	timestamp time.Time
 }
 
@@ -29,10 +28,11 @@ func makeip4targets(ip4net *net.IPNet, baseTimeout time.Duration) ip4targets {
 	broadcast := network | ^mask
 	network++
 	targets := make(map[ip4]*ip4target, broadcast-network)
+	backoff := backoff{timeout: baseTimeout, exp: 1}
 	for ; network < broadcast; network++ {
 		var ip [4]byte
 		binary.BigEndian.PutUint32(ip[:], network)
-		targets[ip] = &ip4target{timeout: baseTimeout}
+		targets[ip] = &ip4target{backoff: backoff}
 	}
 	return ip4targets{baseTimeout: baseTimeout, targets: targets}
 }
@@ -40,7 +40,7 @@ func makeip4targets(ip4net *net.IPNet, baseTimeout time.Duration) ip4targets {
 func (t ip4targets) reset(ip4 ip4) {
 	target := t.targets[ip4]
 	target.Lock()
-	target.timeout = t.baseTimeout
+	target.backoff = backoff{timeout: t.baseTimeout, exp: 1}
 	target.timestamp = time.Now()
 	target.Unlock()
 }
@@ -62,11 +62,7 @@ func (t ip4targets) loop(ctx context.Context, tick time.Duration, fn func(ip4) e
 				continue
 			}
 			target.timestamp = now
-			newTimeout := t.baseTimeout + time.Duration(rand.Int63n(1+int64(target.timeout)*3-int64(t.baseTimeout)))
-			if newTimeout > maxTimeout {
-				newTimeout = maxTimeout
-			}
-			target.timeout = newTimeout
+			target.increaseTimeout(t.baseTimeout, maxTimeout)
 			target.Unlock()
 
 			if err := fn(ip4); err != nil {

@@ -16,7 +16,7 @@ import (
 type CLI struct {
 	Iface       string        `kong:"arg,placeholder='eth0',help='Network interface.'"`
 	Debug       bool          `kong:"short='d',help='Enable debug logging.'"`
-	TTL         time.Duration `kong:"short='t',help='Cache TTL.',default=10s"`
+	TTL         time.Duration `kong:"short='t',help='Cache TTL.',default=30s"`
 	Listen      string        `kong:"short='l',default='127.0.0.1:5333',help='DNS server listen on.'"`
 	Domain      string        `kong:"short='n',default='.dnsharper.local',help='Domain.'"`
 	AliasesFile *os.File      `kong:"name='aliases',short='a',help='MAC to hostname mapping file.'"`
@@ -38,8 +38,11 @@ func main() {
 
 	cache := collections.NewLRUCache(256 * 256)
 	cache.OnEvicted = func(key collections.Key, value interface{}) {
+		domain := strings.ReplaceAll(key.(string), ":", "-") + "." + cli.Domain
+		domain, _ = strings.CutPrefix(domain, "ipv4-")
+		domain, _ = strings.CutPrefix(domain, "ipv6-")
 		log.WithFields(log.Fields{
-			"domain": strings.ReplaceAll(key.(string), ":", "-") + "." + cli.Domain,
+			"domain": domain,
 			"ip":     value.(net.IP),
 		}).Debug("Evicted from cache")
 	}

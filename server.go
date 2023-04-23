@@ -53,12 +53,15 @@ func (srv Server) ServeDNS(rw dns.ResponseWriter, req *dns.Msg) {
 	domain := question.Name
 	log := log.WithField("domain", strings.TrimSuffix(domain, "."))
 
-	if qclass := question.Qclass; qclass != dns.ClassINET {
+	qclass := question.Qclass
+	if qclass != dns.ClassINET {
 		log.Debugf("Got unsupported qclass %s", dns.Class(qclass))
 		formatError(rw, req)
 		return
 	}
-	if qtype := question.Qtype; qtype != dns.TypeA {
+
+	qtype := question.Qtype
+	if qtype != dns.TypeA && qtype != dns.TypeAAAA {
 		log.Debugf("Got unsupported qtype %s", dns.Type(qtype))
 		formatError(rw, req)
 		return
@@ -82,27 +85,48 @@ func (srv Server) ServeDNS(rw dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	value, ok := srv.cache.Get(hwAddr.String())
-	if !ok {
-		log.Debug("Cache entry not found")
-		nameError(rw, req)
-		return
+	var (
+		ip net.IP
+		record dns.RR
+	)
+	hdr := dns.RR_Header{
+		Name:   question.Name,
+		Rrtype: qtype,
+		Class:  qclass,
+		Ttl:    0,
 	}
-	ip := value.(net.IP)
+	switch qtype {
+	case dns.TypeA:
+		value, ok := srv.cache.Get("ipv4-" + hwAddr.String())
+		if !ok {
+			log.Debug("Cache entry not found")
+			nameError(rw, req)
+			return
+		}
+		ip = value.(net.IP)
+		record = &dns.A{
+			Hdr: hdr,
+			A:   ip.To4(),
+		}
+	case dns.TypeAAAA:
+		value, ok := srv.cache.Get("ipv6-" + hwAddr.String())
+		if !ok {
+			log.Debug("Cache entry not found")
+			nameError(rw, req)
+			return
+		}
+		ip = value.(net.IP)
+		record = &dns.AAAA{
+			Hdr:  hdr,
+			AAAA: ip.To16(),
+		}
+	}
 
 	log.WithField("ip", ip).Debug("Sending reply")
 
 	var reply dns.Msg
 	reply.SetReply(req)
-	reply.Answer = []dns.RR{&dns.A{
-		Hdr: dns.RR_Header{
-			Name:   question.Name,
-			Rrtype: dns.TypeA,
-			Class:  dns.ClassINET,
-			Ttl:    0,
-		},
-		A: ip.To4(),
-	}}
+	reply.Answer = []dns.RR{record}
 	if err := rw.WriteMsg(&reply); err != nil {
 		log.WithError(err).Error("Failed to write a dns reply")
 	}
