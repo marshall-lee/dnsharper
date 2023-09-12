@@ -45,7 +45,7 @@ func (t ip4targets) reset(ip4 ip4) {
 	target.Unlock()
 }
 
-func (t ip4targets) loop(ctx context.Context, tick time.Duration, fn func(ip4) error) error {
+func (t ip4targets) loop(ctx context.Context, fn func(ip4) error) error {
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 	for {

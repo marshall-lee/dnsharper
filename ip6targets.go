@@ -51,7 +51,7 @@ func (t *ip6targets) reset(ip6 ip6) {
 	t.Unlock()
 }
 
-func (t *ip6targets) loop(ctx context.Context, tick time.Duration, fn func(ip6) error) error {
+func (t *ip6targets) loop(ctx context.Context, fn func(ip6) error) error {
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 	for {

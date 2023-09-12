@@ -21,6 +21,7 @@ import (
 )
 
 const maxTimeout = 10 * time.Second
+const tick = 10 * time.Millisecond
 
 type Scanner struct {
 	iface        *net.Interface
@@ -30,7 +31,6 @@ type Scanner struct {
 	arpTargets   ip4targets
 	ndpTargets   *ip6targets
 	cacheTTL     time.Duration
-	interval     time.Duration
 	timeout      time.Duration
 	domainFormat string
 	revAliases   map[string][]string
@@ -80,8 +80,6 @@ func NewScanner(ifaceName string, cacheTTL time.Duration, domain string, aliases
 		revAliases[hwAddr] = append(revAliases[hwAddr], host)
 	}
 
-	// TODO: move to parameters
-	interval := 10 * time.Millisecond
 	timeout := 1000 * time.Millisecond
 
 	var (
@@ -104,7 +102,6 @@ func NewScanner(ifaceName string, cacheTTL time.Duration, domain string, aliases
 		arpTargets:   arpTargets,
 		ndpTargets:   ndpTargets,
 		cacheTTL:     cacheTTL,
-		interval:     interval,
 		timeout:      timeout,
 		domainFormat: "%s." + domain + ".",
 		revAliases:   revAliases,
@@ -281,7 +278,7 @@ func (scanner Scanner) writerARP(ctx context.Context) error {
 		FixLengths:       true,
 		ComputeChecksums: true,
 	}
-	return scanner.arpTargets.loop(ctx, scanner.interval, func(ip4 ip4) error {
+	return scanner.arpTargets.loop(ctx, func(ip4 ip4) error {
 		arp.DstProtAddress = ip4[:]
 		if err := gopacket.SerializeLayers(buf, opts, &eth, &arp); err != nil {
 			return err
@@ -322,7 +319,7 @@ func (scanner Scanner) writerNDP(ctx context.Context) error {
 		FixLengths:       true,
 		ComputeChecksums: true,
 	}
-	return scanner.ndpTargets.loop(ctx, scanner.interval, func(ip6 ip6) error {
+	return scanner.ndpTargets.loop(ctx, func(ip6 ip6) error {
 		targetIP := net.IP(ip6[:])
 		copy(ipv6.DstIP[13:], targetIP[len(targetIP)-3:])
 		copy(eth.DstMAC[2:], ipv6.DstIP[len(ipv6.DstIP)-4:])
