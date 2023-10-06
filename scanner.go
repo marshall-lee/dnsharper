@@ -39,7 +39,7 @@ type Scanner struct {
 
 var ErrNoNetworksFound = errors.New("no networks found")
 
-func NewScanner(ifaceName string, cacheTTL time.Duration, domain string, aliases map[string]string, cache *collections.LRUCache) (Scanner, error) {
+func NewScanner(ifaceName string, cacheTTL time.Duration, domain string, aliases map[string][]string, cache *collections.LRUCache) (Scanner, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return Scanner{}, err
@@ -76,8 +76,10 @@ func NewScanner(ifaceName string, cacheTTL time.Duration, domain string, aliases
 	}
 
 	revAliases := make(map[string][]string, len(aliases))
-	for host, hwAddr := range aliases {
-		revAliases[hwAddr] = append(revAliases[hwAddr], host)
+	for host, hwAddrs := range aliases {
+		for _, hwAddr := range hwAddrs {
+			revAliases[hwAddr] = append(revAliases[hwAddr], host)
+		}
 	}
 
 	timeout := 1000 * time.Millisecond

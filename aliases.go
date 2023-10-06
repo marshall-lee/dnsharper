@@ -9,10 +9,10 @@ import (
 	"unicode"
 )
 
-func readAliases(readerCloser io.ReadCloser, domain string) (map[string]string, error) {
+func readAliases(readerCloser io.ReadCloser, domain string) (map[string][]string, error) {
 	defer readerCloser.Close()
 	input := bufio.NewReader(readerCloser)
-	result := make(map[string]string)
+	result := make(map[string][]string)
 	var eof bool
 	for !eof {
 		line, err := input.ReadString('\n')
@@ -57,7 +57,8 @@ func readAliases(readerCloser io.ReadCloser, domain string) (map[string]string, 
 		if err != nil {
 			return nil, err
 		}
-		result[fmt.Sprintf("%s.%s.", hostName, domain)] = fmt.Sprintf("%s.%s.", strings.ReplaceAll(hwAddr.String(), ":", "-"), domain)
+		domainKey := fmt.Sprintf("%s.%s.", hostName, domain)
+		result[domainKey] = append(result[domainKey], fmt.Sprintf("%s.%s.", strings.ReplaceAll(hwAddr.String(), ":", "-"), domain))
 	}
 	return result, nil
 }

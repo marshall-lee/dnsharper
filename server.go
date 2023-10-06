@@ -14,12 +14,12 @@ import (
 
 type Server struct {
 	dns          *dns.Server
-	aliases      map[string]string
+	aliases      map[string][]string
 	cache        *collections.LRUCache
 	domainRegexp *regexp.Regexp
 }
 
-func NewServer(listenAddr string, domain string, aliases map[string]string, cache *collections.LRUCache) (Server, error) {
+func NewServer(listenAddr string, domain string, aliases map[string][]string, cache *collections.LRUCache) (Server, error) {
 	var (
 		srv Server
 		err error
@@ -67,69 +67,75 @@ func (srv Server) ServeDNS(rw dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	if name, ok := srv.aliases[domain]; ok {
-		domain = name
+	var candidates []string
+	if names, ok := srv.aliases[domain]; ok {
+		candidates = names
+	} else {
+		candidates = []string{domain}
 	}
 
-	matches := srv.domainRegexp.FindStringSubmatch(domain)
-	if len(matches) == 0 {
-		log.Debug("Domain does not match the pattern")
-		nameError(rw, req)
+	for _, candidate := range candidates {
+		matches := srv.domainRegexp.FindStringSubmatch(candidate)
+		if len(matches) == 0 {
+			log.WithField("candidate", candidate).Debug("Domain does not match the pattern")
+			continue
+		}
+
+		mac := matches[1]
+		hwAddr, err := net.ParseMAC(mac)
+		if err != nil {
+			log.WithError(err).WithField("mac", mac).Debug("Failed to parse MAC")
+			continue
+		}
+
+		var (
+			ip     net.IP
+			record dns.RR
+		)
+		hdr := dns.RR_Header{
+			Name:   question.Name,
+			Rrtype: qtype,
+			Class:  qclass,
+			Ttl:    0,
+		}
+		switch qtype {
+		case dns.TypeA:
+			key := "ipv4-" + hwAddr.String()
+			value, ok := srv.cache.Get(key)
+			if !ok {
+				log.WithField("key", key).Debug("Cache entry not found")
+				continue
+			}
+			ip = value.(net.IP)
+			record = &dns.A{
+				Hdr: hdr,
+				A:   ip.To4(),
+			}
+		case dns.TypeAAAA:
+			key := "ipv6-" + hwAddr.String()
+			value, ok := srv.cache.Get(key)
+			if !ok {
+				log.WithField("key", key).Debug("Cache entry not found")
+				continue
+			}
+			ip = value.(net.IP)
+			record = &dns.AAAA{
+				Hdr:  hdr,
+				AAAA: ip.To16(),
+			}
+		}
+
+		log.WithField("ip", ip).Debug("Sending reply")
+
+		var reply dns.Msg
+		reply.SetReply(req)
+		reply.Answer = []dns.RR{record}
+		if err := rw.WriteMsg(&reply); err != nil {
+			log.WithError(err).Error("Failed to write a dns reply")
+		}
 		return
 	}
-
-	hwAddr, err := net.ParseMAC(matches[1])
-	if err != nil {
-		log.WithError(err).Debug("Failed to parse MAC")
-		nameError(rw, req)
-		return
-	}
-
-	var (
-		ip net.IP
-		record dns.RR
-	)
-	hdr := dns.RR_Header{
-		Name:   question.Name,
-		Rrtype: qtype,
-		Class:  qclass,
-		Ttl:    0,
-	}
-	switch qtype {
-	case dns.TypeA:
-		value, ok := srv.cache.Get("ipv4-" + hwAddr.String())
-		if !ok {
-			log.Debug("Cache entry not found")
-			nameError(rw, req)
-			return
-		}
-		ip = value.(net.IP)
-		record = &dns.A{
-			Hdr: hdr,
-			A:   ip.To4(),
-		}
-	case dns.TypeAAAA:
-		value, ok := srv.cache.Get("ipv6-" + hwAddr.String())
-		if !ok {
-			log.Debug("Cache entry not found")
-			nameError(rw, req)
-			return
-		}
-		ip = value.(net.IP)
-		record = &dns.AAAA{
-			Hdr:  hdr,
-			AAAA: ip.To16(),
-		}
-	}
-
-	log.WithField("ip", ip).Debug("Sending reply")
-
-	var reply dns.Msg
-	reply.SetReply(req)
-	reply.Answer = []dns.RR{record}
-	if err := rw.WriteMsg(&reply); err != nil {
-		log.WithError(err).Error("Failed to write a dns reply")
-	}
+	nameError(rw, req)
 }
 
 func formatError(rw dns.ResponseWriter, req *dns.Msg) {

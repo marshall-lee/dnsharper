@@ -49,7 +49,7 @@ func main() {
 
 	var err error
 
-	var aliases map[string]string
+	var aliases map[string][]string
 	if cli.AliasesFile != nil {
 		if aliases, err = readAliases(cli.AliasesFile, cli.Domain); err != nil {
 			log.WithError(err).Fatal("Failed to read aliases file")
