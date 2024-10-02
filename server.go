@@ -103,9 +103,10 @@ func (srv Server) ServeDNS(rw dns.ResponseWriter, req *dns.Msg) {
 			key := "ipv4-" + hwAddr.String()
 			value, ok := srv.cache.Get(key)
 			if !ok {
-				log.WithField("key", key).Debug("Cache entry not found")
+				log.WithField("key", key).Debug("Cache entry NOT found")
 				continue
 			}
+			log.WithField("key", key).Debug("Cache entry found")
 			ip = value.(net.IP)
 			record = &dns.A{
 				Hdr: hdr,
@@ -115,9 +116,10 @@ func (srv Server) ServeDNS(rw dns.ResponseWriter, req *dns.Msg) {
 			key := "ipv6-" + hwAddr.String()
 			value, ok := srv.cache.Get(key)
 			if !ok {
-				log.WithField("key", key).Debug("Cache entry not found")
+				log.WithField("key", key).Debug("Cache entry NOT found")
 				continue
 			}
+			log.WithField("key", key).Debug("Cache entry found")
 			ip = value.(net.IP)
 			record = &dns.AAAA{
 				Hdr:  hdr,

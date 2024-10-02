@@ -244,6 +244,7 @@ func (scanner Scanner) reader(ctx context.Context) error {
 			log := log.WithFields(log.Fields{
 				"ip":     targetIP,
 				"domain": strings.TrimSuffix(domain, "."),
+				"key":    targetHwAddrKey,
 			})
 			if aliases, ok := scanner.revAliases[domain]; ok {
 				for i, alias := range aliases {
